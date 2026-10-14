@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>伞迹 · 3D 滑翔伞轨迹复盘</title>
+  <!-- PWA：可安装 / 离线缓存外壳 -->
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#0b1120" />
+  <!-- Cesium（CDN，需联网；1.103 稳定版） -->
+  <link href="https://cdn.jsdelivr.net/npm/cesium@1.103.0/Build/Cesium/Widgets/widgets.css" rel="stylesheet" />
+  <!-- ECharts（高度曲线联动） -->
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+  <link rel="stylesheet" href="css/style.css" />
+  <script>
+    // PWA 注册（离线可打开；注意：Cesium/ECharts 为 CDN 资源，卫星瓦片仍需联网）
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', function () {
+        navigator.serviceWorker.register('service-worker.js').catch(function (e) {
+          console.warn('SW 注册失败（不影响使用）：', e);
+        });
+      });
+    }
+  </script>
+</head>
+<body data-view="replay">
+  <!-- 三维地球容器（始终在底层） -->
+  <div id="cesiumContainer"></div>
+
+  <!-- 诊断条（渲染错误/容错提示，替代系统弹窗） -->
+  <div id="diagBar" style="display:none; position:fixed; top:calc(env(safe-area-inset-top) + 56px); left:50%; transform:translateX(-50%); z-index:99; background:rgba(127,29,29,.92); color:#fee2e2; font-size:12px; padding:8px 16px; border-radius:10px; max-width:88vw; text-align:center; border:1px solid #fca5a5;"></div>
+
+  <!-- 未填 Cesium token 提示条 -->
+  <div id="tokenBar" class="token-bar">
+    未启用真实 3D 山体。在 index.html 顶部填入 <b>Cesium Ion 免费 token</b>，轨迹高度将与山体海拔对齐
+    <button id="tokenClose" class="mini-btn">知道了</button>
+  </div>
+
+  <!-- 禁飞危险区域告警条 -->
+  <div id="dangerBar" style="display:none; position:fixed; top:calc(env(safe-area-inset-top) + 56px); left:50%; transform:translateX(-50%); z-index:98; background:rgba(153,27,27,.94); color:#fecaca; font-size:13px; font-weight:700; padding:9px 18px; border-radius:10px; max-width:88vw; text-align:center; border:1px solid #f87171; animation:pulse 1.2s infinite;"></div>
+
+  <!-- 姿态异常告警条（俯仰振荡/全失速/螺旋下降等，回放时红色高亮） -->
+  <div id="stateBar" style="display:none; position:fixed; top:calc(env(safe-area-inset-top) + 96px); left:50%; transform:translateX(-50%); z-index:97; background:rgba(88,28,135,.94); color:#f5d0fe; font-size:13px; font-weight:700; padding:9px 18px; border-radius:10px; max-width:88vw; text-align:center; border:1px solid #c084fc; animation:pulse 1.2s infinite;"></div>
+
+  <!-- ========== 顶部 Tab ========== -->
+  <div class="tab-bar">
+    <button class="tab-btn tab-active" data-view="replay">复盘</button>
+    <button class="tab-btn" data-view="community">社区</button>
+    <button class="tab-btn" data-view="flylog">飞行记录</button>
+  </div>
+
+  <!-- ========== 复盘视图 ========== -->
+  <div class="replay-ui">
+    <div class="top-bar">
+      <div class="brand">🪂 伞迹 <span class="brand-sub">轨迹复盘</span></div>
+      <div class="tool-group">
+        <label class="btn" for="fileInput">导入</label>
+        <input id="fileInput" type="file" accept=".igc,.kml,.gpx,application/octet-stream,text/plain" hidden />
+        <div class="btn-group" id="sourceGroup">
+          <button class="btn btn-active" data-src="esri">卫星</button>
+          <button class="btn" data-src="amap">高德</button>
+          <button class="btn" data-src="opentopo">等高线</button>
+          <button class="btn" data-src="tianditu">天地图</button>
+        </div>
+        <button class="btn" id="btnSites">基地图层</button>
+        <button class="btn" id="btnFollow">相机: 跟随</button>
+        <button class="btn" id="btnChart">高度曲线</button>
+        <button class="btn" id="btnColor">着色:速度</button>
+        <button class="btn" id="btnCompare">对比</button>
+      </div>
+    </div>
+
+    <div class="track-info">
+      <div class="track-title" id="trackName">示例：泰安周边越野飞行</div>
+      <div class="track-meta" id="trackMeta">—</div>
+      <div class="track-meta" id="trackWeather" style="color:#5eead4"></div>
+      <div class="track-summary" id="trackSummary"></div>
+      <div class="track-coord" id="trackCoord"></div>
+      <div class="track-actions">
+        <button class="mini-btn" id="btnSaveTrack">保存</button>
+        <button class="mini-btn mini-primary" id="btnShareTrack">分享社区</button>
+      </div>
+    </div>
+
+    <!-- 右侧飞行电脑式数据面板：高度/相对高度/升降/速度/滑翔比/姿态 -->
+    <div class="hud-panel">
+      <div class="hud-row"><span class="hud-label">高度</span><span class="hud-num" id="hudAlt">0</span><span class="hud-unit">m</span></div>
+      <div class="hud-row"><span class="hud-label">相对</span><span class="hud-num" id="hudRel">0</span><span class="hud-unit">m</span></div>
+      <div class="hud-row"><span class="hud-label">升降</span><span class="hud-num" id="hudClimb">0.0</span><span class="hud-unit">m/s</span></div>
+      <div class="hud-row"><span class="hud-label">速度</span><span class="hud-num" id="hudSpeed">0</span><span class="hud-unit">km/h</span></div>
+      <div class="hud-row"><span class="hud-label">滑翔比</span><span class="hud-num" id="hudGlide">—</span><span class="hud-unit">:1</span></div>
+      <div class="hud-row"><span class="hud-label">姿态</span><span class="hud-num" id="hudState" style="font-size:13px;color:#38bdf8">巡航</span><span class="hud-unit"></span></div>
+      <div class="hud-row"><span class="hud-label">时间</span><span class="hud-num" id="hudTime">00:00</span><span class="hud-unit">/<span id="hudTotal">00:00</span></span></div>
+    </div>
+
+    <div class="chart-panel" id="chartPanel">
+      <div class="chart-head">高度 · 时间 <span class="chart-close" id="chartClose">✕</span></div>
+      <div id="chartBox"></div>
+    </div>
+
+    <div class="control-bar">
+      <button class="play-btn" id="btnPlay">▶</button>
+      <div class="progress-wrap">
+        <input type="range" id="seek" class="seek" min="0" max="1000" step="1" value="0" />
+        <div class="tick-row">
+          <span class="tick" style="left:0%">00:00</span>
+          <span class="tick" style="left:25%">—</span>
+          <span class="tick" style="left:50%">—</span>
+          <span class="tick" style="left:75%">—</span>
+          <span class="tick" style="left:100%">—</span>
+        </div>
+      </div>
+      <button class="speed-btn" id="btnSpeed">2x</button>
+    </div>
+  </div>
+
+  <!-- ========== 社区视图 ========== -->
+  <div id="viewCommunity" class="page-view">
+    <div class="pv-head">
+      <div class="pv-title">飞手社区 <span class="pv-sub">上传分享 IGC 轨迹 · 同基地飞手互相学习</span></div>
+      <div class="pv-head-right">
+        <span id="sessionInfo" class="session-info">—</span>
+        <button class="pv-btn pv-ghost" id="btnSiteAdmin" style="display:none">基地管理</button>
+        <button class="pv-btn pv-ghost" id="btnAuth">登录/注册</button>
+        <button class="pv-btn" id="btnUploadTrack">＋ 上传</button>
+        <input id="fileUpload" type="file" accept=".igc,.kml,.gpx,application/octet-stream,text/plain" hidden />
+      </div>
+    </div>
+    <div class="chip-row" id="baseChips"></div>
+    <div id="communityList" class="card-list"></div>
+  </div>
+
+  <!-- ========== 飞行记录视图 ========== -->
+  <div id="viewFlylog" class="page-view">
+    <div class="pv-head">
+      <div class="pv-title">飞行记录 <span class="pv-sub">记录每次飞行</span></div>
+      <div class="pv-head-right">
+        <button class="pv-btn pv-ghost" id="btnGear">装备</button>
+        <button class="pv-btn pv-ghost" id="btnAnnual">年度报告</button>
+      </div>
+    </div>
+    <form id="flylogForm" class="flylog-form">
+      <div class="fl-grid">
+        <label>日期<input type="date" id="flDate" required /></label>
+        <label>场地/基地<input type="text" id="flSite" placeholder="如：泰山伞场" required /></label>
+        <label>天气<select id="flWeather">
+          <option value="">选择</option>
+          <option>晴</option><option>多云</option><option>阴</option><option>小雨</option><option>大风</option>
+        </select></label>
+        <label>风速 m/s<input type="number" id="flWind" step="0.1" min="0" placeholder="如 3.5" /></label>
+        <label>飞行次数<input type="number" id="flCount" min="1" placeholder="如 3" /></label>
+        <label>伞型<input type="text" id="flGlider" placeholder="如 CHILI 3" /></label>
+      </div>
+      <label class="fl-note">备注<textarea id="flNote" rows="2" placeholder="热气流/飞行体验/注意点…"></textarea></label>
+      <div class="fl-actions">
+        <label class="fl-share"><input type="checkbox" id="flShared" /> 分享到社区</label>
+        <button type="submit" class="pv-btn" id="btnAddFlylog">保存</button>
+      </div>
+    </form>
+    <div id="flylogList" class="card-list"></div>
+  </div>
+
+  <!-- ========== 评论弹层 ========== -->
+  <div id="commentModal" class="modal">
+    <div class="modal-box">
+      <div class="modal-title" id="commentTitle">评价轨迹</div>
+      <div class="star-row" id="starRow">
+        <span class="star" data-v="1">★</span><span class="star" data-v="2">★</span><span class="star" data-v="3">★</span><span class="star" data-v="4">★</span><span class="star" data-v="5">★</span>
+      </div>
+      <textarea id="commentText" rows="3" placeholder="说说这条轨迹的线路 / 热气流 / 着陆…"></textarea>
+      <div class="modal-actions">
+        <button class="pv-btn pv-ghost" id="commentCancel">取消</button>
+        <button class="pv-btn" id="commentOk">提交</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 配置区：Cesium Ion token（真实 3D 山体）与天地图 key（天地图卫星） -->
+  <!-- ========== 登录 / 注册弹层 ========== -->
+  <div id="authModal" class="modal">
+    <div class="modal-box">
+      <div class="modal-title" id="authTitle">飞手登录</div>
+      <div id="authFields" class="auth-fields">
+        <label>飞手昵称<input type="text" id="authNickname" placeholder="如：泰山老王" /></label>
+        <label>密码<input type="password" id="authPassword" placeholder="登录密码" /></label>
+      </div>
+      <div id="regFields" class="auth-fields" style="display:none">
+        <label>飞手昵称<input type="text" id="regNickname" placeholder="社区展示名，登录用" /></label>
+        <label>身份
+          <select id="regRole">
+            <option value="pilot">普通飞手</option>
+            <option value="admin">基地管理员</option>
+          </select>
+        </label>
+        <label id="regBaseLabel">所属滑翔基地<input type="text" id="regBase" placeholder="如：泰山伞场" /></label>
+        <label id="regAdminBaseLabel" style="display:none">我管理的滑翔基地<input type="text" id="regAdminBase" placeholder="创建你的基地，如：徂徕山伞场" /></label>
+        <label>联系信息<input type="text" id="regContact" placeholder="电话 / 微信（可选）" /></label>
+        <label>密码<input type="password" id="regPassword" placeholder="设置登录密码" /></label>
+      </div>
+      <div class="modal-actions">
+        <button class="pv-btn pv-ghost" id="authSwitch" data-mode="reg">注册新账号</button>
+        <button class="pv-btn pv-ghost" id="authCancel">取消</button>
+        <button class="pv-btn" id="authOk">登录</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== 上传轨迹信息填写弹层 ========== -->
+  <div id="uploadModal" class="modal">
+    <div class="modal-box">
+      <div class="modal-title">发布轨迹 <span class="pv-sub" style="display:inline;color:#64748b" id="uploadFileName"></span></div>
+      <div class="auth-fields">
+        <label>飞行标题<input type="text" id="upTitle" placeholder="如：泰山热气流越野 50km" /></label>
+        <label>起飞基地<input type="text" id="upBase" placeholder="选择或输入基地名" list="baseList" /><datalist id="baseList"></datalist></label>
+        <label>飞行照片<input type="file" id="upPhoto" accept="image/*" /><img id="upPhotoPreview" class="photo-preview" alt="照片预览" style="display:none" /></label>
+        <label>飞行笔记<textarea id="upNote" rows="2" placeholder="热气流位置 / 航线选择 / 降落心得…"></textarea></label>
+        <label>可见性
+          <select id="upVisibility">
+            <option value="public">公开分享（所有人可见）</option>
+            <option value="private">仅自己可见</option>
+          </select>
+        </label>
+      </div>
+      <div class="modal-actions">
+        <button class="pv-btn pv-ghost" id="upCancel">取消</button>
+        <button class="pv-btn" id="upOk">发布</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== 飞手个人主页弹层 ========== -->
+  <div id="profileModal" class="modal">
+    <div class="modal-box">
+      <div class="modal-title" id="profileTitle">飞手主页</div>
+      <div id="profileBody"></div>
+      <div class="modal-actions">
+        <button class="pv-btn pv-ghost" id="profileClose">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== 基地管理弹层（仅基地管理员） ========== -->
+  <div id="siteAdminModal" class="modal">
+    <div class="modal-box">
+      <div class="modal-title">基地管理 <span class="pv-sub" style="display:inline;color:#64748b">绘制危险/禁飞区 · 校准起降场</span></div>
+      <div id="siteAdminBody"></div>
+      <div class="modal-actions">
+        <button class="pv-btn pv-ghost" id="siteAdminClose">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== 危险/禁飞区域绘制完成弹层（填名称备注） ========== -->
+  <div id="drawModal" class="modal">
+    <div class="modal-box">
+      <div class="modal-title">保存危险/禁飞区域</div>
+      <div class="auth-fields">
+        <label>区域名称<input type="text" id="drawName" placeholder="如：高压线走廊 / 背风危险区 / 禁飞空域" /></label>
+        <label>备注说明<textarea id="drawNote" rows="2" placeholder="风险说明：如 35kV 高压线横穿山谷，背风乱流区…"></textarea></label>
+      </div>
+      <div class="modal-actions">
+        <button class="pv-btn pv-ghost" id="drawCancel">取消</button>
+        <button class="pv-btn" id="drawOk">保存区域</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== 添加起飞/降落场弹层（地图点选后填名称） ========== -->
+  <div id="placeModal" class="modal">
+    <div class="modal-box">
+      <div class="modal-title" id="placeTitle">添加起飞场</div>
+      <div class="auth-fields">
+        <label>点位名称<input type="text" id="placeName" placeholder="如：西坡起飞场" /></label>
+        <label>坐标<span id="placeCoord" style="color:#7dd3fc">点击地图选择位置…</span></label>
+      </div>
+      <div class="modal-actions">
+        <button class="pv-btn pv-ghost" id="placeCancel">取消</button>
+        <button class="pv-btn" id="placeOk">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== 编队对比弹层（选择第二条轨迹叠加回放） ========== -->
+  <div id="compareModal" class="modal">
+    <div class="modal-box">
+      <div class="modal-title">编队轨迹对比 <span class="pv-sub" style="display:inline;color:#64748b">两条轨迹同步回放 · 橙色为对比轨迹</span></div>
+      <div class="auth-fields">
+        <label>上传 IGC 作为对比轨迹<input type="file" id="compareFile" accept=".igc,.kml,.gpx,application/octet-stream,text/plain" /></label>
+      </div>
+      <div style="font-size:12px;color:#94a3b8;margin:8px 0 4px">或选择社区公开轨迹：</div>
+      <div id="compareList" style="max-height:38vh;overflow-y:auto"></div>
+      <div class="modal-actions">
+        <button class="pv-btn pv-ghost" id="compareClose">关闭</button>
+        <button class="pv-btn pv-ghost" id="compareClear">清除对比</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== 装备管理弹层 ========== -->
+  <div id="gearModal" class="modal">
+    <div class="modal-box">
+      <div class="modal-title">装备管理 <span class="pv-sub" style="display:inline;color:#64748b">伞翼 / 吊带 / 副伞 · 飞行小时提醒</span></div>
+      <div class="auth-fields">
+        <label>装备名称<input type="text" id="gearName" placeholder="如：CHILI 3 / STRIKE 2" /></label>
+        <label>类型
+          <select id="gearType"><option>伞翼</option><option>吊带</option><option>副伞</option><option>其他</option></select>
+        </label>
+        <label>累计飞行小时<input type="number" id="gearHours" min="0" step="0.5" placeholder="手动累计飞行小时" /></label>
+        <label>建议检查/更换小时<input type="number" id="gearService" min="0" placeholder="如伞翼 300h 检修 / 副伞 10 年" /></label>
+      </div>
+      <div class="modal-actions">
+        <button class="pv-btn pv-ghost" id="gearAdd">添加</button>
+        <button class="pv-btn pv-ghost" id="gearClose">关闭</button>
+      </div>
+      <div id="gearList" style="margin-top:10px"></div>
+    </div>
+  </div>
+
+  <!-- ========== 年度飞行报告弹层 ========== -->
+  <div id="annualModal" class="modal">
+    <div class="modal-box">
+      <div class="modal-title" id="annualTitle">年度飞行报告</div>
+      <div id="annualBody"></div>
+      <div class="modal-actions">
+        <button class="pv-btn pv-ghost" id="annualClose">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== 热气流明细弹层 ========== -->
+  <div id="thermalModal" class="modal">
+    <div class="modal-box">
+      <div class="modal-title">热气流明细 <span class="pv-sub" style="display:inline;color:#64748b">每个上升区段的效率</span></div>
+      <div id="thermalBody"></div>
+      <div class="modal-actions">
+        <button class="pv-btn pv-ghost" id="thermalClose">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Cesium Ion token：已配置，启用 Bing 高清卫星 + Cesium World Terrain（SRTM30 级真实山体）
+    var ION_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjNsSHhFN3llaUFBakZ5d0wiLCJqdGkiOiI3YzJhNDgzMC1hYzI5LTRjMDYtODY1Ni01NDg2MTRhYjBiMWIiLCJpZCI6NTI0NzE5LCJpc3MiOiJodHRwczovL2FwaS5jZXNpdW0uY29tIiwiYXVkIjoidW5kZWZpbmVkX2RlZmF1bHQiLCJpYXQiOjE3OTE5OTI1MTV9.WwFRuA_h_igdAH2tNePzME7xwTU6dCfBXdjimtGzCIg';
+    // 天地图 key：已配置，天地图卫星影像（CGCS2000，无偏移）直接可用
+    var TIANDITU_KEY = '8736917028ca5a91068b85d4190332c7';
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/cesium@1.103.0/Build/Cesium/Cesium.js"></script>
+  <script src="js/demo-data.js"></script>
+  <script src="js/app-core.js"></script>
+  <script src="js/storage.js"></script>
+  <script src="js/main.js"></script>
+</body>
+</html>
